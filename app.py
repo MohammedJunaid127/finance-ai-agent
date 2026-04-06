@@ -1,108 +1,241 @@
 import streamlit as st
 import pandas as pd
+import os
+from datetime import date
+import plotly.express as px
 
-from ocr_engine import extract_text, extract_amount
+from ocr_engine import extract_text, extract_amount, extract_merchant
+from database import add_expense_db, get_expenses_db
+from advisor import generate_advice
+from dotenv import load_dotenv
+from advisor import generate_advice, extract_pdf_text, summarize_text   
 
-st.title("💰 FinTrack AI - Personal Finance Assistant")
-st.header("Monthly income")
-income = st.number_input("Enter Monthly Income (₹)", min_value=0)
-st.header("Add Expense")
+# ---------------- LOAD API KEY ----------------
+load_dotenv(dotenv_path="advisorapi.env")
+api_key = os.getenv("OPENAI_API_KEY")
 
-amount = st.number_input("Enter Amount (₹)", min_value=0)
+if api_key:
+    os.environ["OPENAI_API_KEY"] = api_key
 
-category = st.selectbox(
-    "Select Category",
-    ["Food", "Travel", "Shopping", "Bills", "Other"]
-)
+# ---------------- LOGIN SYSTEM ----------------
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
 
-description = st.text_input("Description")
+def login():
+    st.title("🔐 FinTrack AI Login")
+    col1, col2, col3 = st.columns([1, 2, 1])
 
+    with col2:
+        username = st.text_input("Username", key="login_user")
+        password = st.text_input("Password", type="password", key="login_pass")
+
+        if st.button("Login"):
+            if username.strip() == "admin" and password.strip() == "1234":
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+def logout():
+    st.session_state.logged_in = False
+    st.rerun()
+
+if not st.session_state.logged_in:
+    login()
+    st.stop()
+
+# ---------------- HEADER ----------------
+h1, h2 = st.columns([6,1])
+h1.title("💰 FinTrack AI")
+if h2.button("🚪 Logout"):
+    logout()
+
+# ---------------- SESSION ----------------
 if "expenses" not in st.session_state:
-    st.session_state.expenses = []
+    try:
+        data = get_expenses_db()
+        st.session_state.expenses = [
+            {"Amount": r[0], "Category": r[1], "Description": r[2], "Date": str(date.today())}
+            for r in data
+        ] if data else []
+    except:
+        st.session_state.expenses = []
 
-if st.button("Add Expense"):
-    expense = {
-        "Amount": amount,
-        "Category": category,
-        "Description": description
-    }
-    
-    st.session_state.expenses.append(expense)
-    st.success("Expense added successfully!")
+if "knowledge" not in st.session_state:
+    st.session_state.knowledge = ""
 
-st.header("Expense History")
+# ---------------- INPUT ----------------
+income = st.number_input("Monthly Income (₹)", min_value=0)
 
-if st.session_state.expenses:
-    df = pd.DataFrame(st.session_state.expenses)
-    st.table(df)
+# ---------------- TABS ----------------
+tab1, tab2, tab3, tab4 = st.tabs(["💰 Expenses", "📊 Dashboard", "📷 OCR", "🤖 Advisor"])
 
+# ================= TAB 1 =================
+with tab1:
+    st.header("Add Expense")
 
+    amount = st.number_input("Amount", min_value=0, key="amt")
+    category = st.selectbox("Category", ["Food","Travel","Shopping","Bills","Other"], key="cat")
+    description = st.text_input("Description", key="desc")
 
-# Spending Summary
-st.header("📊 Spending Summary")
+    if st.button("Add Expense"):
+        if amount > 0:
+            exp = {
+                "Amount": amount,
+                "Category": category,
+                "Description": description,
+                "Date": str(date.today())
+            }
+            st.session_state.expenses.append(exp)
 
-if st.session_state.expenses:
-    df = pd.DataFrame(st.session_state.expenses)
+            try:
+                add_expense_db(amount, category, description)
+            except:
+                pass
 
-    total_spent = df["Amount"].sum()
-    st.metric("Total Money Spent", f"₹{total_spent}")
-    if income > 0:
-        remaining = income - total_spent
-        st.metric("Remaining Budget", f"₹{remaining}")
-        saving_rate = (remaining / income) * 100
-        st.metric("Saving Rate", f"{saving_rate:.1f}%")
+            st.success("Added!")
 
+    # 🔍 SEARCH
+    search = st.text_input("Search")
 
-    category_spending = df.groupby("Category")["Amount"].sum()
+    data = st.session_state.expenses
+    if search:
+        data = [e for e in data if search.lower() in e["Description"].lower()]
 
-    st.subheader("Category-wise Spending")
-    st.bar_chart(category_spending)
-st.header("💡 Financial Insights")
+    # LIST
+    for i, exp in enumerate(data):
+        c1, c2, c3, c4, c5 = st.columns([2,2,3,1,1])
+        c1.write(f"₹{exp['Amount']}")
+        c2.write(exp["Category"])
+        c3.write(exp["Description"])
 
-if st.session_state.expenses:
-    df = pd.DataFrame(st.session_state.expenses)
+        if c4.button("✏️", key=f"edit_{i}"):
+            st.session_state.edit_index = i
 
-    # Insight 1: Highest spending category
-    category_totals = df.groupby("Category")["Amount"].sum()
-    highest_category = category_totals.idxmax()
-    highest_amount = category_totals.max()
+        if c5.button("🗑️", key=f"del_{i}"):
+            st.session_state.expenses.pop(i)
+            st.rerun()
 
-    st.write(f"📌 You spend the most on **{highest_category} (₹{highest_amount})**.")
+    # EDIT
+    if "edit_index" in st.session_state:
+        i = st.session_state.edit_index
+        exp = st.session_state.expenses[i]
 
-    # Insight 2: Check if any category exceeds 40%
-    total_spent = df["Amount"].sum()
+        st.subheader("Edit Expense")
 
-    for category, amount in category_totals.items():
-        percentage = (amount / total_spent) * 100
+        new_amt = st.number_input("Amount", value=exp["Amount"])
+        new_cat = st.selectbox("Category", ["Food","Travel","Shopping","Bills","Other"],
+                               index=["Food","Travel","Shopping","Bills","Other"].index(exp["Category"]))
+        new_desc = st.text_input("Description", value=exp["Description"])
 
-        if percentage > 40:
-            st.warning(f"⚠ {category} spending is {percentage:.1f}% of your expenses. Consider reducing it.")
+        if st.button("Save"):
+            st.session_state.expenses[i] = {
+                "Amount": new_amt,
+                "Category": new_cat,
+                "Description": new_desc,
+                "Date": exp["Date"]
+            }
+            del st.session_state.edit_index
+            st.rerun()
 
-    # Insight 3: Saving suggestion
-    if total_spent > 5000:
-        st.info("💰 Your spending is quite high. Try saving at least 20% of your income.")
-    if income > 0 and total_spent > income:
-        st.error("🚨You have exceeded your monthly budget!")
-    elif total_spent > income * 0.8:
-            st.warning("⚠ You have used more than 80% of your budget")
+# ================= TAB 2 =================
+with tab2:
+    st.header("Dashboard")
 
-st.header("📷 Upload Payment Screenshot")
+    if st.session_state.expenses:
+        df = pd.DataFrame(st.session_state.expenses)
 
-uploaded_image = st.file_uploader(
-    "Upload a payment screenshot",
-    type=["png", "jpg", "jpeg"]
-)
+        total = df["Amount"].sum()
 
-if uploaded_image is not None:
-    st.image(uploaded_image, caption="Uploaded Screenshot")
+        c1, c2 = st.columns(2)
+        c1.metric("Total", f"₹{total}")
 
-    if st.button("Extract Expense"):
-        text = extract_text(uploaded_image)
+        if income > 0:
+            c2.metric("Remaining", f"₹{income-total}")
 
-        st.subheader("Extracted Text")
-        st.write(text)
+        # BAR
+        st.bar_chart(df.groupby("Category")["Amount"].sum())
 
-        amount = extract_amount(text)
+        # PIE
+        fig = px.pie(df, names="Category", values="Amount")
+        st.plotly_chart(fig)
 
-        if amount:
-            st.success(f"Detected Amount: ₹{amount}")
+        # CSV
+        st.download_button("Download CSV", df.to_csv(index=False), "expenses.csv")
+
+# ================= TAB 3 =================
+with tab3:
+    st.header("OCR")
+
+    img = st.file_uploader("Upload", type=["png","jpg","jpeg"])
+
+    if img:
+        st.image(img)
+
+        if st.button("Extract"):
+            text = extract_text(img)
+            st.text_area("OCR", text)
+
+            amt = extract_amount(text)
+            merchant = extract_merchant(text)
+
+            if amt:
+                st.session_state.expenses.append({
+                    "Amount": amt,
+                    "Category": "Other",
+                    "Description": merchant,
+                    "Date": str(date.today())
+                })
+                st.success("Added!")
+
+# ================= TAB 4 =================
+with tab4:
+    st.header("🤖 AI Financial Advisor")
+
+    # Manual knowledge input
+    knowledge_input = st.text_area("Enter financial knowledge")
+
+    if knowledge_input:
+        st.session_state.knowledge = knowledge_input
+
+    # PDF Upload
+    st.subheader("📚 Upload Financial PDF")
+
+    uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
+
+    pdf_text = ""
+
+    if uploaded_pdf:
+        try:
+            raw_text = extract_pdf_text(uploaded_pdf)
+
+            # Apply summarization (OPTION C)
+            pdf_text = summarize_text(raw_text)
+
+            st.success("PDF processed successfully!")
+
+            # Optional preview
+            with st.expander("Preview PDF Content"):
+                st.write(pdf_text[:500])
+
+        except:
+            st.error("Error reading PDF")
+
+    # Combine knowledge
+    final_knowledge = st.session_state.knowledge + "\n" + pdf_text
+
+    # Generate Advice
+    if st.button("Generate Advice"):
+        if st.session_state.expenses and income > 0:
+
+            advice = generate_advice(
+                st.session_state.expenses,
+                income,
+                final_knowledge
+            )
+
+            st.subheader("📊 Personalized Advice")
+            st.write(advice)
+
+        else:
+            st.warning("Add expenses and income first.")
